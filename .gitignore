@@ -1,0 +1,13 @@
+venv/
+.venv/
+__pycache__/
+*.pyc
+.env
+.streamlit/secrets.toml
+
+# uploaded test media
+*.webm
+*.mp4
+*.mov
+*.avi
+*.mkv

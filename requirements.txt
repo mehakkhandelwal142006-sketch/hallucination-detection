@@ -1,0 +1,17 @@
+# CPU-only PyTorch (much smaller than the default CUDA build; no GPU is needed)
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch
+
+streamlit
+pandas
+numpy
+altair
+pypdf
+
+sentence-transformers
+transformers
+
+# Speech-to-text for the video source.
+# av is pinned: newer PyAV versions break faster-whisper ("metadata_errors" error).
+faster-whisper==1.2.1
+av==15.1.0
