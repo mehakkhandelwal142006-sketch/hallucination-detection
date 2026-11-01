@@ -22,6 +22,7 @@ import os
 import random
 import re
 import tempfile
+import time
 from collections import Counter
 from datetime import datetime
 
@@ -398,17 +399,30 @@ def generate_answer(question, api_key):
         models.remove(last)
         models.insert(0, last)
 
-    problem = ""
+    problem, last_err, tried = "", None, []
     for model in models[:4]:
-        try:
-            response = client.models.generate_content(
-                model=model, contents=question, config=config
-            )
-        except genai_errors.APIError as err:
-            if getattr(err, "code", None) == 404:  # this model name does not exist -> try the next
-                problem = f"Model {model} is not available."
-                continue
-            raise
+        response = None
+        for attempt in range(2):  # one quick retry when Google is temporarily overloaded
+            try:
+                response = client.models.generate_content(
+                    model=model, contents=question, config=config
+                )
+                break
+            except genai_errors.APIError as err:
+                code = getattr(err, "code", None)
+                if code in (500, 502, 503, 504) and attempt == 0:
+                    time.sleep(2)
+                    continue
+                if code in (404, 429, 500, 502, 503, 504):
+                    # model missing / overloaded / out of quota -> try the next model
+                    last_err = err
+                    tried.append(model)
+                    break
+                raise  # e.g. invalid API key: no point trying other models
+
+        if response is None:
+            continue
+
         text = (response.text or "").strip()
         if text:
             st.session_state["gemini_model"] = model
@@ -416,6 +430,9 @@ def generate_answer(question, api_key):
         problem = "Gemini returned an empty answer (it may have been blocked by a safety filter)."
         break
 
+    if last_err is not None:
+        last_err.tried = tried
+        raise last_err
     raise RuntimeError(problem or "No Gemini model was available.")
 
 
@@ -433,12 +450,14 @@ def clean_generated(text):
 def friendly_error(err):
     code = getattr(err, "code", None)
     text = str(err)
+    tried = getattr(err, "tried", None)
+    suffix = f" (models tried: {', '.join(tried)})" if tried else ""
     if code == 429:
-        return "Gemini's free quota is used up for now (too many requests). Wait a minute and try again, or paste an answer yourself."
+        return "Gemini's free quota is used up for now (too many requests). Wait a minute and try again, or paste an answer yourself." + suffix
     if code in (401, 403) or "API key" in text or "API_KEY" in text:
         return "Gemini did not accept the API key. Check GEMINI_API_KEY in Secrets (cloud) or in the .env file (local)."
     if code in (500, 502, 503, 504):
-        return "Gemini is busy right now. Please try again in a moment."
+        return f"Gemini is overloaded right now (error {code}). Please try again in a minute." + suffix
     if isinstance(err, RuntimeError):
         return text
     return f"Gemini request failed{f' ({code})' if code else ''}: {text[:200]}"
