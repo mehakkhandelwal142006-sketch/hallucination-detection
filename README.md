@@ -55,8 +55,20 @@ The models are downloaded automatically on first use.
 
 **Optional:** put an image named `background.jpg` next to `app.py` to use it as the page background.
 
+## Optional: generate the answer with Gemini (Google GenAI)
+
+Type a question and click **Generate answer with Gemini**. Gemini answers from its own knowledge (it never sees your source documents; only the question is sent). The answer is then split into claims and verified against the trusted source, so you can measure how faithful an LLM answer is to a document.
+
+1. Create a free API key in Google AI Studio.
+2. **Local:** copy `.env.example` to `.env` and put the key in it.
+3. **Streamlit Cloud:** App settings → Secrets → `GEMINI_API_KEY = "your-key"`.
+
+Never commit the real key to GitHub. At most 8 Gemini answers are allowed per browser session to protect the free quota.
+
+Note: *Unsupported* means "not found in the trusted source", not "false in the real world".
+
 ## Limitations / future work
 
 - Claims are checked sentence by sentence; compound claims are not split yet.
 - NLI works best on short, self-contained sentences.
-- Planned: answer generation with an LLM (Google GenAI), claim splitting, larger NLI model, evaluation on a labelled test set (accuracy, precision, recall, F1, confusion matrix).
+- Planned: claim splitting, larger NLI model, evaluation on a labelled test set (accuracy, precision, recall, F1, confusion matrix).

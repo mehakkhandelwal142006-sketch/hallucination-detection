@@ -15,3 +15,7 @@ transformers
 # av is pinned: newer PyAV versions break faster-whisper ("metadata_errors" error).
 faster-whisper==1.2.1
 av==15.1.0
+
+# Google GenAI (Gemini): generates the answer that is then verified
+google-genai
+python-dotenv
