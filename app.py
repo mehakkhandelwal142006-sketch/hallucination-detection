@@ -35,6 +35,24 @@ from pypdf import PdfReader
 from sentence_transformers import SentenceTransformer
 from transformers import AutoModelForSequenceClassification, AutoTokenizer
 
+# Google GenAI (Gemini) is optional: without it the app still works with pasted answers.
+try:
+    from google import genai
+    from google.genai import errors as genai_errors
+    from google.genai import types as genai_types
+
+    HAS_GENAI = True
+except Exception:
+    HAS_GENAI = False
+
+# python-dotenv is optional: it lets you keep the API key in a local .env file.
+try:
+    from dotenv import load_dotenv
+
+    load_dotenv()
+except Exception:
+    pass
+
 # FAISS is optional. If it is not installed we fall back to exact NumPy search.
 try:
     import faiss  # type: ignore
@@ -307,6 +325,123 @@ def answer_question(question, units, index, k=6, min_sim=0.30):
     ]
 
     return {"found": True, "text": " ".join(h["text"] for h in hits), "hits": hits}
+
+
+# =========================================================
+# GEMINI (Google GenAI) — generate an answer that will be verified
+# =========================================================
+
+GEN_LIMIT = 8  # max Gemini calls per browser session (protects the free quota)
+
+# Used only if the live model list cannot be read. Override with GEMINI_MODEL in secrets / .env.
+FALLBACK_MODELS = ["gemini-3.8-flash", "gemini-3.5-flash-lite", "gemini-2.5-flash", "gemini-2.0-flash"]
+
+GEN_INSTRUCTION = (
+    "Answer the user's question from your general knowledge in 4 to 7 short, factual sentences. "
+    "Write each sentence on its own line. "
+    "Do not use bullet points, numbering, markdown, headings or quotation marks. "
+    "Do not use pronouns such as 'it', 'this' or 'they' for the topic: repeat the subject by name "
+    "so that every sentence makes sense on its own. "
+    "Do not add an introduction or a conclusion."
+)
+
+
+def get_secret(name):
+    """Read a setting from Streamlit secrets (cloud) or environment / .env (local)."""
+    try:
+        value = st.secrets.get(name)
+        if value:
+            return str(value).strip()
+    except Exception:
+        pass
+    return (os.environ.get(name) or "").strip()
+
+
+@st.cache_resource(ttl=3600, show_spinner=False)
+def gemini_client(api_key):
+    return genai.Client(api_key=api_key)
+
+
+def choose_models(client):
+    """Pick Gemini models to try: GEMINI_MODEL override, else newest Flash from Google's live list."""
+    override = get_secret("GEMINI_MODEL")
+    if override:
+        return [m.strip() for m in override.split(",") if m.strip()]
+
+    found = []
+    try:
+        for m in client.models.list():
+            name = (m.name or "").replace("models/", "")
+            actions = getattr(m, "supported_actions", None) or []
+            if actions and "generateContent" not in actions:
+                continue
+            match = re.fullmatch(r"gemini-(\d+(?:\.\d+)*)-flash(-lite)?", name)
+            if match:
+                version = tuple(int(x) for x in match.group(1).split("."))
+                found.append((version, match.group(2) is None, name))
+    except Exception:
+        pass
+
+    found.sort(reverse=True)  # newest version first, plain Flash before Flash-Lite
+    names = [n for _, _, n in found]
+    return names + [m for m in FALLBACK_MODELS if m not in names]
+
+
+def generate_answer(question, api_key):
+    """Ask Gemini to answer the question. Returns (text, model_name)."""
+    client = gemini_client(api_key)
+    config = genai_types.GenerateContentConfig(system_instruction=GEN_INSTRUCTION)
+
+    models = choose_models(client)
+    last = st.session_state.get("gemini_model")
+    if last in models:
+        models.remove(last)
+        models.insert(0, last)
+
+    problem = ""
+    for model in models[:4]:
+        try:
+            response = client.models.generate_content(
+                model=model, contents=question, config=config
+            )
+        except genai_errors.APIError as err:
+            if getattr(err, "code", None) == 404:  # this model name does not exist -> try the next
+                problem = f"Model {model} is not available."
+                continue
+            raise
+        text = (response.text or "").strip()
+        if text:
+            st.session_state["gemini_model"] = model
+            return text, model
+        problem = "Gemini returned an empty answer (it may have been blocked by a safety filter)."
+        break
+
+    raise RuntimeError(problem or "No Gemini model was available.")
+
+
+def clean_generated(text):
+    """Turn Gemini's reply into plain lines: no markdown, bullets, numbering or questions."""
+    lines = []
+    for raw in text.splitlines():
+        line = re.sub(r"[*`]+", "", raw)
+        line = re.sub(r"^\s*(#+|>|[-•]|\d+[.)])\s*", "", line).strip()
+        if len(line) > 5 and not line.endswith("?"):
+            lines.append(line)
+    return "\n".join(lines[:10])
+
+
+def friendly_error(err):
+    code = getattr(err, "code", None)
+    text = str(err)
+    if code == 429:
+        return "Gemini's free quota is used up for now (too many requests). Wait a minute and try again, or paste an answer yourself."
+    if code in (401, 403) or "API key" in text or "API_KEY" in text:
+        return "Gemini did not accept the API key. Check GEMINI_API_KEY in Secrets (cloud) or in the .env file (local)."
+    if code in (500, 502, 503, 504):
+        return "Gemini is busy right now. Please try again in a moment."
+    if isinstance(err, RuntimeError):
+        return text
+    return f"Gemini request failed{f' ({code})' if code else ''}: {text[:200]}"
 
 
 # =========================================================
@@ -1165,6 +1300,7 @@ with glass("card_source"):
 
 
 def load_demo_claims():
+    st.session_state.pop("ai_meta", None)
     st.session_state["question_input"] = "What is artificial intelligence?"
     st.session_state["claims_input"] = (
         "AI systems can recognize images.\n"
@@ -1175,6 +1311,7 @@ def load_demo_claims():
 
 
 def clear_claims():
+    st.session_state.pop("ai_meta", None)
     st.session_state["question_input"] = ""
     st.session_state["claims_input"] = ""
 
@@ -1192,12 +1329,57 @@ with glass("card_ask"):
         placeholder="Example:\nWhat is artificial intelligence?",
     )
 
+    # --- Gemini: write an answer to the question, which is then verified below ---
+    g1, g2 = st.columns([1.4, 3])
+    generate_clicked = g1.button("🤖 Generate answer with Gemini")
+    g2.caption(
+        "Gemini answers from its own knowledge (it never sees your source). "
+        "Then this system checks that answer against your trusted source."
+    )
+
+    if generate_clicked:
+        gen_questions = [q.strip() for q in question_input.splitlines() if q.strip()][:3]
+        api_key = get_secret("GEMINI_API_KEY") or get_secret("GOOGLE_API_KEY")
+        used_so_far = st.session_state.get("gen_count", 0)
+
+        if not gen_questions:
+            st.warning("Type a question first, then click the button.")
+        elif not HAS_GENAI:
+            st.warning("The google-genai package is not installed (pip install google-genai).")
+        elif not api_key:
+            st.info(
+                "Gemini key not set. Local: put GEMINI_API_KEY=your-key in a .env file. "
+                "Cloud: add GEMINI_API_KEY in the app's Secrets. "
+                "You can still paste an answer manually below."
+            )
+        elif used_so_far + len(gen_questions) > GEN_LIMIT:
+            st.warning(f"Limit reached: at most {GEN_LIMIT} Gemini answers per session. Paste an answer manually.")
+        else:
+            try:
+                with st.spinner("Gemini is writing an answer…"):
+                    parts, used_model = [], ""
+                    for q in gen_questions:
+                        text, used_model = generate_answer(q, api_key)
+                        st.session_state["gen_count"] = st.session_state.get("gen_count", 0) + 1
+                        parts.append(clean_generated(text))
+                answer_text = "\n".join(p for p in parts if p)
+                if answer_text:
+                    # allowed: the answer box below has not been created yet in this run
+                    st.session_state["claims_input"] = answer_text
+                    st.session_state["ai_meta"] = {"model": used_model}
+                else:
+                    st.warning("Gemini's reply had no usable sentences. Try again.")
+            except Exception as err:
+                st.error(friendly_error(err))
+
     claims_input = st.text_area(
         "AI answer / claims to verify — one claim per line",
         key="claims_input",
         height=150,
         placeholder="Example:\nArtificial intelligence is a field of computer science.\nAI can recognize images.",
     )
+    if st.session_state.get("ai_meta"):
+        st.caption(f"🤖 Answer generated by {st.session_state['ai_meta']['model']} — you can edit it before verifying.")
 
     claims, skipped_questions = extract_claims(claims_input)
 
@@ -1271,6 +1453,7 @@ if analyze:
             "n_evidence": len(units),
             "question": question_used,
             "answers": answers,
+            "generated_by": (st.session_state.get("ai_meta") or {}).get("model", ""),
             "cfg": dict(cfg),
             "rows": rows,
         }
@@ -1288,6 +1471,7 @@ if analysis:
     st.caption(
         f"Source: {analysis['source']} · {analysis['n_evidence']} evidence sentences · "
         f"{analysis['time']}"
+        + (f" · answer written by {analysis['generated_by']}" if analysis.get("generated_by") else "")
     )
 
     for a in analysis.get("answers", []):
@@ -1378,6 +1562,10 @@ if analysis:
         st.caption(
             "Reliability = (Supported × 1.0 + Partially Supported × 0.5 + "
             "Contradicted × 0 + Unsupported × 0) ÷ total claims."
+        )
+        st.caption(
+            "Unsupported means the claim was not found in the trusted source. "
+            "It can still be true in the real world; this system checks faithfulness to the source."
         )
 
         st.markdown("#### Claim-by-claim result")
